@@ -1,0 +1,595 @@
+name: Android APK
+
+# Builds the web (WebAssembly) version of FilmCraft and wraps it in an Android app.
+# Run it from the Actions tab ("Run workflow"); the APK appears under the run's Artifacts.
+on:
+  workflow_dispatch:
+  push:
+    paths: [".github/workflows/android-apk.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The whole Android wrapper project lives in this one file, so adding this file is all a
+      # fork needs. It hosts the web build in a WebView (local https origin, file import via the
+      # system picker, exports saved to Download/FilmCraft).
+      - name: Write the Android project
+        run: |
+          set -euo pipefail
+          mkdir -p "android/$(dirname settings.gradle)"
+          cat > "android/settings.gradle" <<'ANDROID_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FilmCraftAndroid"
+          include ':app'
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname build.gradle)"
+          cat > "android/build.gradle" <<'ANDROID_EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname gradle.properties)"
+          cat > "android/gradle.properties" <<'ANDROID_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname app/build.gradle)"
+          cat > "android/app/build.gradle" <<'ANDROID_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.artcraft.filmcraft'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.artcraft.filmcraft'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName '0.1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      // Signed with the debug key so the APK installs directly (sideloading).
+                      signingConfig signingConfigs.debug
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              // The .wasm is already compressed-ish and large; keep it stored so it loads fast.
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
+
+              androidResources {
+                  noCompress += ['wasm']
+              }
+          }
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname app/src/main/AndroidManifest.xml)"
+          cat > "android/app/src/main/AndroidManifest.xml" <<'ANDROID_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:largeHeap="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode"
+                      android:screenOrientation="sensorLandscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname app/src/main/res/values/strings.xml)"
+          cat > "android/app/src/main/res/values/strings.xml" <<'ANDROID_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">FilmCraft</string>
+          </resources>
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname app/src/main/res/values/styles.xml)"
+          cat > "android/app/src/main/res/values/styles.xml" <<'ANDROID_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar.Fullscreen">
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname app/src/main/assets/android-bridge.js)"
+          cat > "android/app/src/main/assets/android-bridge.js" <<'ANDROID_EOF'
+          // Loaded before the app on Android. The WebView can't save blob: downloads by itself, so
+          // anchor clicks with a `download` name are routed to the native side in chunks.
+          (function () {
+            if (!window.FilmCraftAndroid) return;
+            const native = window.FilmCraftAndroid;
+            const CHUNK = 512 * 1024;
+
+            function toBase64(bytes) {
+              let s = "";
+              for (let i = 0; i < bytes.length; i += 0x8000) {
+                s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+              }
+              return btoa(s);
+            }
+
+            async function save(href, name) {
+              const blob = await (await fetch(href)).blob();
+              const id = native.begin(name || "filmcraft-download", blob.type || "application/octet-stream");
+              if (id < 0) return;
+              try {
+                for (let off = 0; off < blob.size; off += CHUNK) {
+                  const buf = new Uint8Array(await blob.slice(off, off + CHUNK).arrayBuffer());
+                  if (!native.chunk(id, toBase64(buf))) throw new Error("write failed");
+                }
+                native.end(id, true);
+              } catch (e) {
+                console.warn("android download failed", e);
+                native.end(id, false);
+              }
+            }
+
+            const click = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function () {
+              const href = this.href || "";
+              if (this.hasAttribute("download") && (href.startsWith("blob:") || href.startsWith("data:"))) {
+                save(href, this.getAttribute("download"));
+                return;
+              }
+              return click.call(this);
+            };
+          })();
+          ANDROID_EOF
+
+          mkdir -p "android/$(dirname app/src/main/java/com/artcraft/filmcraft/MainActivity.java)"
+          cat > "android/app/src/main/java/com/artcraft/filmcraft/MainActivity.java" <<'ANDROID_EOF'
+          package com.artcraft.filmcraft;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.view.View;
+          import android.view.WindowInsets;
+          import android.view.WindowInsetsController;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Toast;
+
+          import java.io.ByteArrayInputStream;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+
+          /**
+           * Hosts the FilmCraft web build (assets/www) in a WebView. Files are served from a virtual
+           * https origin so ES modules, fetch and WebAssembly streaming work like on a real web server.
+           */
+          public class MainActivity extends Activity {
+              private static final String HOST = "appassets.androidplatform.net";
+              private static final String START_URL = "https://" + HOST + "/index.html";
+              private static final int FILE_CHOOSER_REQUEST = 1001;
+
+              private WebView webView;
+              private ValueCallback<Uri[]> pendingFileCallback;
+              private long lastBackPress;
+
+              private final Map<Integer, Download> downloads = new HashMap<>();
+              private int nextDownloadId = 1;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  setContentView(webView);
+                  goFullscreen();
+
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(true);
+                  s.setUseWideViewPort(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setSupportZoom(false);
+                  s.setBuiltInZoomControls(false);
+
+                  webView.addJavascriptInterface(new Bridge(), "FilmCraftAndroid");
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          Uri url = request.getUrl();
+                          if (!HOST.equals(url.getHost())) return null;
+                          return serveAsset(url.getPath());
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri url = request.getUrl();
+                          if (HOST.equals(url.getHost())) return false;
+                          // External links open in the phone's browser.
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, url));
+                          } catch (Exception ignored) {
+                          }
+                          return true;
+                      }
+                  });
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                       FileChooserParams params) {
+                          if (pendingFileCallback != null) pendingFileCallback.onReceiveValue(null);
+                          pendingFileCallback = callback;
+                          Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                          intent.addCategory(Intent.CATEGORY_OPENABLE);
+                          intent.setType("*/*");
+                          if (params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                              intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                          }
+                          try {
+                              startActivityForResult(Intent.createChooser(intent, "Import media"), FILE_CHOOSER_REQUEST);
+                          } catch (Exception e) {
+                              pendingFileCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState);
+                  } else {
+                      webView.loadUrl(START_URL);
+                  }
+              }
+
+              private WebResourceResponse serveAsset(String path) {
+                  if (path == null || path.isEmpty() || path.equals("/")) path = "/index.html";
+                  String assetPath = path.equals("/android-bridge.js") ? "android-bridge.js" : "www" + path;
+                  Map<String, String> headers = new HashMap<>();
+                  headers.put("Cross-Origin-Opener-Policy", "same-origin");
+                  headers.put("Cross-Origin-Embedder-Policy", "require-corp");
+                  headers.put("Cross-Origin-Resource-Policy", "same-origin");
+                  headers.put("Cache-Control", "no-cache");
+                  try {
+                      InputStream in = getAssets().open(assetPath);
+                      if (path.equals("/index.html")) {
+                          // Load the download bridge before the app starts.
+                          String html = new String(readAll(in), StandardCharsets.UTF_8);
+                          html = html.replaceFirst("<head>", "<head>\n  <script src=\"android-bridge.js\"></script>");
+                          in = new ByteArrayInputStream(html.getBytes(StandardCharsets.UTF_8));
+                      }
+                      return new WebResourceResponse(mimeType(path), null, 200, "OK", headers, in);
+                  } catch (IOException e) {
+                      return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", headers,
+                              new ByteArrayInputStream(new byte[0]));
+                  }
+              }
+
+              private static String mimeType(String path) {
+                  String p = path.toLowerCase();
+                  if (p.endsWith(".html")) return "text/html";
+                  if (p.endsWith(".js") || p.endsWith(".mjs")) return "text/javascript";
+                  if (p.endsWith(".wasm")) return "application/wasm";
+                  if (p.endsWith(".css")) return "text/css";
+                  if (p.endsWith(".json")) return "application/json";
+                  if (p.endsWith(".png")) return "image/png";
+                  if (p.endsWith(".svg")) return "image/svg+xml";
+                  if (p.endsWith(".ttf")) return "font/ttf";
+                  if (p.endsWith(".woff2")) return "font/woff2";
+                  return "application/octet-stream";
+              }
+
+              private static byte[] readAll(InputStream in) throws IOException {
+                  ByteArrayOutputStream out = new ByteArrayOutputStream();
+                  byte[] buf = new byte[64 * 1024];
+                  int n;
+                  while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                  in.close();
+                  return out.toByteArray();
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode != FILE_CHOOSER_REQUEST) {
+                      super.onActivityResult(requestCode, resultCode, data);
+                      return;
+                  }
+                  if (pendingFileCallback == null) return;
+                  Uri[] result = null;
+                  if (resultCode == RESULT_OK && data != null) {
+                      List<Uri> uris = new ArrayList<>();
+                      ClipData clip = data.getClipData();
+                      if (clip != null) {
+                          for (int i = 0; i < clip.getItemCount(); i++) uris.add(clip.getItemAt(i).getUri());
+                      } else if (data.getData() != null) {
+                          uris.add(data.getData());
+                      }
+                      if (!uris.isEmpty()) result = uris.toArray(new Uri[0]);
+                  }
+                  pendingFileCallback.onReceiveValue(result);
+                  pendingFileCallback = null;
+              }
+
+              /** Saves downloads (exports, saved projects) to Download/FilmCraft. */
+              private class Bridge {
+                  @JavascriptInterface
+                  public int begin(String name, String mime) {
+                      try {
+                          Download d = new Download(sanitize(name), mime);
+                          synchronized (downloads) {
+                              int id = nextDownloadId++;
+                              downloads.put(id, d);
+                              return id;
+                          }
+                      } catch (Exception e) {
+                          toast("Couldn't save " + name);
+                          return -1;
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public boolean chunk(int id, String base64) {
+                      Download d;
+                      synchronized (downloads) {
+                          d = downloads.get(id);
+                      }
+                      if (d == null) return false;
+                      try {
+                          d.out.write(Base64.decode(base64, Base64.DEFAULT));
+                          return true;
+                      } catch (Exception e) {
+                          return false;
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void end(int id, boolean ok) {
+                      Download d;
+                      synchronized (downloads) {
+                          d = downloads.remove(id);
+                      }
+                      if (d == null) return;
+                      d.finish(ok);
+                      toast(ok ? "Saved to " + d.location : "Couldn't save " + d.name);
+                  }
+              }
+
+              private class Download {
+                  final String name;
+                  final OutputStream out;
+                  final String location;
+                  private Uri uri;
+
+                  Download(String name, String mime) throws IOException {
+                      this.name = name;
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          ContentValues v = new ContentValues();
+                          v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                          v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                          v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FilmCraft");
+                          v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                          ContentResolver r = getContentResolver();
+                          uri = r.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                          if (uri == null) throw new IOException("insert failed");
+                          out = r.openOutputStream(uri);
+                          if (out == null) throw new IOException("open failed");
+                          location = "Download/FilmCraft/" + name;
+                      } else {
+                          File dir = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "FilmCraft");
+                          if (!dir.exists() && !dir.mkdirs()) throw new IOException("mkdir failed");
+                          File f = new File(dir, name);
+                          out = new FileOutputStream(f);
+                          location = f.getAbsolutePath();
+                      }
+                  }
+
+                  void finish(boolean ok) {
+                      try {
+                          out.close();
+                      } catch (IOException ignored) {
+                      }
+                      if (uri == null) return;
+                      ContentResolver r = getContentResolver();
+                      if (ok) {
+                          ContentValues v = new ContentValues();
+                          v.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                          r.update(uri, v, null, null);
+                      } else {
+                          r.delete(uri, null, null);
+                      }
+                  }
+              }
+
+              private static String sanitize(String name) {
+                  String n = name.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+                  return n.isEmpty() ? "filmcraft-download" : n;
+              }
+
+              private void toast(String msg) {
+                  runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+              }
+
+              private void goFullscreen() {
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      WindowInsetsController c = getWindow().getInsetsController();
+                      if (c != null) {
+                          c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                          c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                      }
+                  } else {
+                      getWindow().getDecorView().setSystemUiVisibility(
+                              View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                      | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+                  }
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) goFullscreen();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  long now = System.currentTimeMillis();
+                  if (now - lastBackPress < 2000) {
+                      super.onBackPressed();
+                  } else {
+                      lastBackPress = now;
+                      Toast.makeText(this, "Press back again to exit", Toast.LENGTH_SHORT).show();
+                  }
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  webView.saveState(outState);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  webView.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  webView.onResume();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  webView.destroy();
+                  super.onDestroy();
+              }
+          }
+          ANDROID_EOF
+
+          mkdir -p android/app/src/main/res/mipmap-xxxhdpi
+          cp apps/filmcraft-web/web/favicon.png android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+
+      - name: Rust with the wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: wasm-bindgen CLI (exact crate version)
+        run: |
+          V="$(sed -n 's/^const WASM_BINDGEN: &str = "\(.*\)";$/\1/p' xtask/src/main.rs)"
+          echo "wasm-bindgen $V"
+          if ! { command -v wasm-bindgen >/dev/null && wasm-bindgen --version | grep -qF "$V"; }; then
+            cargo install wasm-bindgen-cli --version "$V" --locked
+          fi
+
+      - name: binaryen (wasm-opt, makes the app smaller and faster)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Build the web app
+        run: cargo xtask web
+
+      - name: Copy the web app into the Android project
+        run: |
+          DIST="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/web/dist"
+          ls -lh "$DIST"
+          mkdir -p android/app/src/main/assets/www
+          cp -R "$DIST/." android/app/src/main/assets/www/
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build the APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Rename
+        run: cp android/app/build/outputs/apk/release/app-release.apk FilmCraft.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FilmCraft-apk
+          path: FilmCraft.apk
+          if-no-files-found: error
