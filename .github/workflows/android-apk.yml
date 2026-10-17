@@ -557,10 +557,7 @@ jobs:
           echo "wasm-bindgen $V"
           if ! { command -v wasm-bindgen >/dev/null && wasm-bindgen --version | grep -qF "$V"; }; then
             cargo install wasm-bindgen-cli --version "$V" --locked
-          fi
-
-      - name: binaryen (wasm-opt, makes the app smaller and faster)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+          fi  
 
       - name: Build the web app
         run: cargo xtask web
