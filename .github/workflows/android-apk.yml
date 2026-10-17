@@ -131,7 +131,7 @@ jobs:
           cat > "android/app/src/main/res/values/strings.xml" <<'ANDROID_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="app_name">FilmCraft</string>
+              <string name="app_name">jamieFilm</string>
           </resources>
           ANDROID_EOF
 
@@ -440,16 +440,16 @@ jobs:
                           ContentValues v = new ContentValues();
                           v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
                           v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-                          v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FilmCraft");
+                          v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/jamieFilm");
                           v.put(MediaStore.MediaColumns.IS_PENDING, 1);
                           ContentResolver r = getContentResolver();
                           uri = r.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
                           if (uri == null) throw new IOException("insert failed");
                           out = r.openOutputStream(uri);
                           if (out == null) throw new IOException("open failed");
-                          location = "Download/FilmCraft/" + name;
+                          location = "Download/jamieFilm/" + name;
                       } else {
-                          File dir = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "FilmCraft");
+                          File dir = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "jamieFilm");
                           if (!dir.exists() && !dir.mkdirs()) throw new IOException("mkdir failed");
                           File f = new File(dir, name);
                           out = new FileOutputStream(f);
@@ -557,7 +557,10 @@ jobs:
           echo "wasm-bindgen $V"
           if ! { command -v wasm-bindgen >/dev/null && wasm-bindgen --version | grep -qF "$V"; }; then
             cargo install wasm-bindgen-cli --version "$V" --locked
-          fi  
+          fi
+
+      # No wasm-opt here: Ubuntu's old binaryen breaks the wasm's externref table
+      # ("WebAssembly.Table.grow(): failed to grow table"). cargo xtask web skips it when absent.
 
       - name: Build the web app
         run: cargo xtask web
@@ -568,6 +571,7 @@ jobs:
           ls -lh "$DIST"
           mkdir -p android/app/src/main/assets/www
           cp -R "$DIST/." android/app/src/main/assets/www/
+          sed -i 's|<title>FilmCraft</title>|<title>jamieFilm</title>|; s|Loading FilmCraft…|Loading jamieFilm…|; s|FilmCraft failed to start|jamieFilm failed to start|; s|FilmCraft stopped working|jamieFilm stopped working|' android/app/src/main/assets/www/index.html
 
       - uses: actions/setup-java@v4
         with:
@@ -583,10 +587,10 @@ jobs:
         run: gradle assembleRelease --no-daemon --stacktrace
 
       - name: Rename
-        run: cp android/app/build/outputs/apk/release/app-release.apk FilmCraft.apk
+        run: cp android/app/build/outputs/apk/release/app-release.apk jamieFilm.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: FilmCraft-apk
-          path: FilmCraft.apk
+          name: jamieFilm-apk
+          path: jamieFilm.apk
           if-no-files-found: error
